@@ -36,7 +36,7 @@ def connect():
         priv = f.read()
     with open(KEY + ".pub") as f:
         pub = f.read()
-    dev = AdbDeviceTcp(tv_ip(), 5555, default_transport_timeout_s=15.0)
+    dev = AdbDeviceTcp(tv_ip(), 5555, default_transport_timeout_s=180.0)
     dev.connect(rsa_keys=[PythonRSASigner(pub, priv)], auth_timeout_s=60.0)
     return dev
 

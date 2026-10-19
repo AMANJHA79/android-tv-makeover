@@ -3,6 +3,7 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 
 import '../model/channel.dart';
+import 'logo_cache.dart';
 
 /// Channel artwork: the channel's logo when it has one, otherwise a generated icon
 /// (colour derived from the name + initials) so every channel is recognisable.
@@ -36,14 +37,15 @@ class _LogoCard extends StatefulWidget {
 }
 
 class _LogoCardState extends State<_LogoCard> {
-  /// url -> true when the logo needs a dark card; null entry while unknown
-  static final Map<String, bool> _darkCache = {};
+  /// url -> true when the logo needs a dark card (remembered on disk between launches)
+  static Map<String, bool> get _darkCache => LogoCache.tones;
   static final Set<String> _failed = {};
 
   ImageProvider? _provider;
   ImageStream? _stream;
   late final ImageStreamListener _listener = ImageStreamListener(_onImage, onError: _onError);
   bool _loaded = false;
+  bool _attaching = false;
 
   String get _url => widget.channel.logoUrl;
 
@@ -51,11 +53,14 @@ class _LogoCardState extends State<_LogoCard> {
   void didChangeDependencies() {
     super.didChangeDependencies();
     if (_provider != null) return;
-    final dpr = MediaQuery.of(context).devicePixelRatio;
+    final dpr = MediaQuery.devicePixelRatioOf(context);
     // decode small: the TV has 1 GB of RAM and lists can hold 1000+ channels
-    _provider = ResizeImage(NetworkImage(_url), width: (widget.width * 0.84 * dpr).round(), allowUpscaling: false);
+    _provider = ResizeImage(CachedLogoImage(_url), width: (widget.width * 0.84 * dpr).round(), allowUpscaling: false);
     _stream = _provider!.resolve(createLocalImageConfiguration(context));
+    // a logo already in memory reports synchronously here: show it in this same build
+    _attaching = true;
     _stream!.addListener(_listener);
+    _attaching = false;
   }
 
   @override
@@ -70,8 +75,12 @@ class _LogoCardState extends State<_LogoCard> {
   }
 
   Future<void> _onImage(ImageInfo info, bool sync) async {
+    if (_attaching && _darkCache.containsKey(_url)) {
+      _loaded = true;   // no setState needed: we're already building
+      return;
+    }
     if (!_darkCache.containsKey(_url)) {
-      _darkCache[_url] = await _needsDarkCard(info.image);
+      LogoCache.rememberTone(_url, await _needsDarkCard(info.image));
     }
     if (mounted) setState(() => _loaded = true);
   }
@@ -111,10 +120,8 @@ class _LogoCardState extends State<_LogoCard> {
       ),
       child: _loaded
           ? Image(image: _provider!, fit: BoxFit.contain, gaplessPlayback: true)
-          // while the logo downloads, show the initials in the channel colour
-          : Center(
-              child: Text(_initials(widget.channel.name),
-                  style: TextStyle(fontSize: widget.height * 0.3, fontWeight: FontWeight.w800, color: _colorFor(widget.channel.name)))),
+          // while the logo downloads: just the empty card (cheap to build)
+          : null,
     );
   }
 }

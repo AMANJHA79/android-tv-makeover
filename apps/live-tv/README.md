@@ -17,7 +17,15 @@ host any content, and channels can go offline at any time.
   `lib/provider/channels_provider.dart`.
 - **Faster:** playlists download in parallel and are parsed off the UI thread; the result is cached so
   the app opens instantly and refreshes in the background; the grid builds lazily and logos are decoded
-  small.
+  small and cached on disk.
+- **Smooth category browsing on a 1 GB TV (Mali-450 GPU):** moving through the sidebar only moves the
+  highlight; the grid switches once you pause (or press Right/OK). Each category's grid is built once
+  and kept, and categories you haven't opened are pre-built while the remote is idle, so switching is
+  just a visibility change. Tiles are flat (no per-tile animation controllers), the grid is one layer,
+  and logos plus their light/dark result are cached on disk. Measured on the TV while paging through all
+  categories: dropped frames went from 20–27% to under 1% (warm) / 3% (fresh launch), and the slowest
+  frame build from 190 ms to 12 ms. Build with `--dart-define=PERF=true` to log per-frame build and
+  raster times to logcat.
 - **Remote-friendly UI:** dark theme, small logo tiles, deterministic D-pad movement (Right into the
   grid, Left from the first column back to the sidebar).
 - **Player:** full screen with a channel banner; Up/Down or Channel +/- changes channel; a stream that

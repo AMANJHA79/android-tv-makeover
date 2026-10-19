@@ -1,4 +1,7 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show ScrollCacheExtent;
 import 'package:flutter/services.dart';
 
 import '../model/channel.dart';
@@ -43,7 +46,6 @@ class _HomeState extends State<Home> {
   static const cols = 6;
 
   final provider = ChannelsProvider();
-  final grid = ScrollController();
 
   List<String> categories = [];
   Map<String, List<Channel>> byCategory = {};
@@ -54,8 +56,28 @@ class _HomeState extends State<Home> {
   final List<FocusNode> sideNodes = [];
   /// one node per tile, keyed "category/index"; kept until the screen closes
   final Map<String, FocusNode> tileNodes = {};
-  int lastTile = 0;
   double rowExtent = 100;
+
+  /// Each category keeps its own grid (built once, then kept alive offstage), scroll position and
+  /// last focused tile, so returning to a category costs nothing.
+  final Map<String, ScrollController> _controllers = {};
+  final Map<String, int> _lastTile = {};
+  final Map<String, Widget> _grids = {};
+  final List<String> _mounted = [];
+  Size? _gridSizes;
+
+  /// Categories not visited yet are pre-built one at a time while the remote is idle.
+  Timer? _prebuildTimer;
+  DateTime _lastInput = DateTime.fromMillisecondsSinceEpoch(0);
+
+  String get _cat => categories[selected];
+  ScrollController get grid => _controllers.putIfAbsent(_cat, () => ScrollController());
+  int get lastTile => _lastTile[_cat] ?? 0;
+  set lastTile(int v) => _lastTile[_cat] = v;
+
+  /// Moving through the sidebar only moves the highlight; the grid switches once you pause.
+  Timer? _switchTimer;
+  static const _switchDelay = Duration(milliseconds: 200);
 
   List<Channel> get current =>
       categories.isEmpty ? const [] : byCategory[categories[selected]] ?? const [];
@@ -101,7 +123,14 @@ class _HomeState extends State<Home> {
       while (sideNodes.length < cats.length) {
         sideNodes.add(FocusNode());
       }
+      // new data: rebuild grids lazily again
+      _grids.clear();
+      _mounted
+        ..clear()
+        ..add(cats[selected]);
     });
+    _prebuildTimer?.cancel();
+    _prebuildTimer = Timer.periodic(const Duration(milliseconds: 400), (_) => _prebuildNext());
     if (first) {
       WidgetsBinding.instance.addPostFrameCallback((_) => sideNodes[selected].requestFocus());
     }
@@ -115,7 +144,11 @@ class _HomeState extends State<Home> {
     for (final n in tileNodes.values) {
       n.dispose();
     }
-    grid.dispose();
+    _switchTimer?.cancel();
+    _prebuildTimer?.cancel();
+    for (final c in _controllers.values) {
+      c.dispose();
+    }
     super.dispose();
   }
 
@@ -125,13 +158,27 @@ class _HomeState extends State<Home> {
 
   void _selectCategory(int i) {
     if (i == selected) return;
-    lastTile = 0;
-    setState(() => selected = i);
-    if (grid.hasClients) grid.jumpTo(0);
+    setState(() {
+      selected = i;
+      if (!_mounted.contains(_cat)) _mounted.add(_cat);
+    });
+  }
+
+  /// Builds one not-yet-visited category offstage, only when no key was pressed recently.
+  void _prebuildNext() {
+    if (!mounted || categories.isEmpty) return;
+    if (DateTime.now().difference(_lastInput) < const Duration(milliseconds: 900)) return;
+    final next = categories.where((c) => !_mounted.contains(c)).firstOrNull;
+    if (next == null) {
+      _prebuildTimer?.cancel();
+      return;
+    }
+    setState(() => _mounted.add(next));
   }
 
   KeyEventResult _sideKey(int i, KeyEvent e) {
     if (e is KeyUpEvent) return KeyEventResult.ignored;
+    _lastInput = DateTime.now();
     final k = e.logicalKey;
     if (k == LogicalKeyboardKey.arrowUp) {
       if (i > 0) sideNodes[i - 1].requestFocus();
@@ -142,7 +189,15 @@ class _HomeState extends State<Home> {
       return KeyEventResult.handled;
     }
     if (k == LogicalKeyboardKey.arrowRight || isSelectKey(k)) {
-      if (current.isNotEmpty) _focusTile(lastTile.clamp(0, current.length - 1));
+      if (i != selected) {
+        _switchTimer?.cancel();
+        _selectCategory(i);
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (current.isNotEmpty) _focusTile(lastTile.clamp(0, current.length - 1));
+        });
+      } else if (current.isNotEmpty) {
+        _focusTile(lastTile.clamp(0, current.length - 1));
+      }
       return KeyEventResult.handled;
     }
     if (k == LogicalKeyboardKey.arrowLeft) return KeyEventResult.handled;
@@ -151,6 +206,7 @@ class _HomeState extends State<Home> {
 
   KeyEventResult _tileKey(int i, KeyEvent e) {
     if (e is KeyUpEvent) return KeyEventResult.ignored;
+    _lastInput = DateTime.now();
     final k = e.logicalKey;
     final n = current.length;
     int? target;
@@ -267,7 +323,12 @@ class _HomeState extends State<Home> {
                 label: categories[i],
                 count: byCategory[categories[i]]?.length ?? 0,
                 selected: i == selected,
-                onFocus: () => _selectCategory(i),
+                onFocus: () {
+                  _switchTimer?.cancel();
+                  _switchTimer = Timer(_switchDelay, () {
+                    if (mounted) _selectCategory(i);
+                  });
+                },
                 onKey: (e) => _sideKey(i, e),
               ),
             ),
@@ -318,32 +379,51 @@ class _HomeState extends State<Home> {
         ),
         Expanded(
           child: LayoutBuilder(builder: (context, box) {
-            const pad = 20.0;
-            final cellW = (box.maxWidth - pad * 2) / cols;
-            final cardW = cellW - 14;
-            final cardH = cardW * 0.58;
-            rowExtent = cardH + 40;
-            return GridView.builder(
-              controller: grid,
-              padding: const EdgeInsets.fromLTRB(pad, 14, pad, 30),
-              gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: cols,
-                mainAxisExtent: rowExtent,
-              ),
-              itemCount: list.length,
-              itemBuilder: (context, i) => _Tile(
-                key: ValueKey('${categories[selected]}/$i'),
-                channel: list[i],
-                node: _tileNode(i),
-                cardW: cardW,
-                cardH: cardH,
-                onKey: (e) => _tileKey(i, e),
-                onTap: () => _play(i),
-              ),
+            if (_gridSizes != box.biggest) {
+              _gridSizes = box.biggest;
+              _grids.clear();
+            }
+            return IndexedStack(
+              index: _mounted.indexOf(_cat),
+              children: [
+                // same widget instance each time -> Flutter skips rebuilding hidden grids
+                for (final c in _mounted) _grids.putIfAbsent(c, () => _grid(c, box.maxWidth)),
+              ],
             );
           }),
         ),
       ],
+    );
+  }
+
+  Widget _grid(String cat, double width) {
+    const pad = 20.0;
+    final cellW = (width - pad * 2) / cols;
+    final cardW = cellW - 14;
+    final cardH = cardW * 0.58;
+    rowExtent = cardH + 40;
+    final list = byCategory[cat] ?? const <Channel>[];
+    return GridView.builder(
+      key: ValueKey('grid/$cat'),
+      controller: _controllers.putIfAbsent(cat, () => ScrollController()),
+      scrollCacheExtent: ScrollCacheExtent.pixels(rowExtent),
+      addAutomaticKeepAlives: false,
+      // one layer for the whole grid instead of one per tile: cheaper to composite on a Mali-450
+      addRepaintBoundaries: false,
+      padding: const EdgeInsets.fromLTRB(pad, 14, pad, 30),
+      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: cols,
+        mainAxisExtent: rowExtent,
+      ),
+      itemCount: list.length,
+      itemBuilder: (context, i) => _Tile(
+        key: ValueKey('$cat/$i'),
+        channel: list[i],
+        node: tileNodes.putIfAbsent('$cat/$i', () => FocusNode()),
+        cardW: cardW,
+        cardH: cardH,
+        onKey: (e) => _tileKey(i, e),
+      ),
     );
   }
 }
@@ -419,7 +499,6 @@ class _Tile extends StatefulWidget {
   final FocusNode node;
   final double cardW, cardH;
   final KeyEventResult Function(KeyEvent) onKey;
-  final VoidCallback onTap;
 
   const _Tile({
     super.key,
@@ -428,7 +507,6 @@ class _Tile extends StatefulWidget {
     required this.cardW,
     required this.cardH,
     required this.onKey,
-    required this.onTap,
   });
 
   @override
@@ -440,45 +518,46 @@ class _TileState extends State<_Tile> {
 
   @override
   Widget build(BuildContext context) {
+    // Kept deliberately flat: ~40 of these are built whenever the category changes.
+    Widget card = Padding(
+      padding: const EdgeInsets.all(4.5),
+      child: ChannelIcon(channel: widget.channel, width: widget.cardW - 9, height: widget.cardH - 9),
+    );
+    if (focused) {
+      card = Transform.scale(
+        scale: 1.1,
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(12.5),
+            border: Border.all(color: Colors.white, width: 2),
+          ),
+          child: card,
+        ),
+      );
+    }
     return Focus(
       focusNode: widget.node,
       onFocusChange: (f) => setState(() => focused = f),
       onKeyEvent: (_, e) => widget.onKey(e),
-      child: GestureDetector(
-        onTap: widget.onTap,
-        child: Column(
-          children: [
-            AnimatedScale(
-              scale: focused ? 1.1 : 1.0,
-              duration: const Duration(milliseconds: 120),
-              child: AnimatedContainer(
-                duration: const Duration(milliseconds: 120),
-                padding: const EdgeInsets.all(2.5),
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(12.5),
-                  border: Border.all(color: focused ? Colors.white : Colors.transparent, width: 2),
-                ),
-                child: ChannelIcon(channel: widget.channel, width: widget.cardW - 9, height: widget.cardH - 9),
-              ),
+      child: Column(
+        children: [
+          card,
+          const SizedBox(height: 7),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 4),
+            child: Text(
+              widget.channel.name,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
+              style: focused ? _nameFocused : _name,
             ),
-            const SizedBox(height: 7),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 4),
-              child: Text(
-                widget.channel.name,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  color: focused ? Colors.white : const Color(0xFFA0A0AA),
-                  fontSize: 11.5,
-                  fontWeight: focused ? FontWeight.w600 : FontWeight.w500,
-                ),
-              ),
-            ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
+
+  static const _name = TextStyle(color: Color(0xFFA0A0AA), fontSize: 11.5, fontWeight: FontWeight.w500);
+  static const _nameFocused = TextStyle(color: Colors.white, fontSize: 11.5, fontWeight: FontWeight.w600);
 }
