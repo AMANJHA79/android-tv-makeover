@@ -59,13 +59,18 @@ final class PhoneServer {
     private final KeyInjector keys;
     private volatile boolean connecting;
 
-    // pairing: one 6-digit code at a time; wrong guesses count across codes, and too many lock
-    // pairing for 10 minutes, doubling each time, so the code can't be brute-forced from the network
+    // pairing: one 6-digit code at a time. Wrong guesses are counted per device (IP): 5 lock that
+    // device out for 10 minutes, doubling each time, so a stranger on the Wi-Fi can't lock you out.
+    // Each code also dies after 20 wrong guesses in total, so many devices can't brute-force it.
     private String pairCode;
     private long pairUntil;
-    private int failures;
-    private long lockedUntil;
-    private long lockMs = 10 * 60_000L;
+    private int codeFailures;
+    private static final class Strikes {
+        int failures;
+        long lockedUntil;
+        long lockMs = 10 * 60_000L;
+    }
+    private final Map<String, Strikes> strikes = new HashMap<>();
 
     // apps (with banners) are cached briefly: rendering them is the slow part
     private AppRepo.Result apps;
@@ -120,7 +125,14 @@ final class PhoneServer {
         final Map<String, String> query = new HashMap<>();
         final Map<String, String> headers = new HashMap<>();
         byte[] body = new byte[0];
+        int length;
+        String ip = "";
     }
+
+    /** Routes anyone on the network may call (pairing, the page itself); their bodies are tiny. */
+    private static final Set<String> OPEN = new HashSet<>(java.util.Arrays.asList(
+            "/", "/index.html", "/icon.png", "/favicon.ico", "/api/pair", "/api/pair/confirm"));
+    private static final int MAX_OPEN_BODY = 4096;
 
     private void handle(Socket s) {
         try (Socket sock = s) {
@@ -129,6 +141,16 @@ final class PhoneServer {
             OutputStream out = sock.getOutputStream();
             Req r = read(in);
             if (r == null) return;
+            r.ip = sock.getInetAddress().getHostAddress();
+            // decide whether this caller may send a body before allocating it: only paired phones
+            // get the large limit (photo uploads), so nobody else can make the TV run out of memory
+            int max = OPEN.contains(r.path) ? MAX_OPEN_BODY : authorised(r) ? MAX_BODY : 0;
+            if (r.length > max) {
+                json(out, OPEN.contains(r.path) || authorised(r) ? 413 : 401,
+                        err(authorised(r) || OPEN.contains(r.path) ? "too large" : "not paired"));
+                return;
+            }
+            if (!readBody(in, r)) return;
             route(r, out);
         } catch (Exception ignored) {
         }
@@ -156,20 +178,23 @@ final class PhoneServer {
             int colon = h.indexOf(':');
             if (colon > 0) r.headers.put(h.substring(0, colon).trim().toLowerCase(Locale.US), h.substring(colon + 1).trim());
         }
-        int len = 0;
         try {
-            len = Integer.parseInt(r.headers.getOrDefault("content-length", "0"));
-        } catch (NumberFormatException ignored) {
+            r.length = Integer.parseInt(r.headers.getOrDefault("content-length", "0"));
+        } catch (NumberFormatException e) {
+            return null;
         }
-        if (len < 0 || len > MAX_BODY) return null;
-        r.body = new byte[len];
+        return r.length < 0 ? null : r;
+    }
+
+    private static boolean readBody(InputStream in, Req r) throws Exception {
+        r.body = new byte[r.length];
         int off = 0;
-        while (off < len) {
-            int n = in.read(r.body, off, len - off);
-            if (n < 0) return null;
+        while (off < r.length) {
+            int n = in.read(r.body, off, r.length - off);
+            if (n < 0) return false;
             off += n;
         }
-        return r;
+        return true;
     }
 
     private static String readLine(InputStream in) throws Exception {
@@ -192,7 +217,8 @@ final class PhoneServer {
     }
 
     private static void send(OutputStream out, int code, String type, byte[] body, String extra) throws Exception {
-        String status = code == 200 ? "OK" : code == 401 ? "Unauthorized" : code == 404 ? "Not Found" : "Error";
+        String status = code == 200 ? "OK" : code == 401 ? "Unauthorized" : code == 404 ? "Not Found"
+                : code == 413 ? "Payload Too Large" : "Error";
         String head = "HTTP/1.1 " + code + " " + status + "\r\n"
                 + "Content-Type: " + type + "\r\n"
                 + "Content-Length: " + body.length + "\r\n"
@@ -235,10 +261,10 @@ final class PhoneServer {
                 send(out, 200, "image/png", icon(), "max-age=86400");
                 return;
             case "/api/pair":
-                json(out, 200, startPairing());
+                json(out, 200, startPairing(r.ip));
                 return;
             case "/api/pair/confirm":
-                json(out, 200, confirmPairing(param(r, "code")));
+                json(out, 200, confirmPairing(param(r, "code"), r.ip));
                 return;
         }
         if (!authorised(r)) {
@@ -353,12 +379,21 @@ final class PhoneServer {
         if (tokens.remove(t)) prefs.edit().putStringSet("tokens", tokens).apply();
     }
 
-    private synchronized JSONObject startPairing() throws Exception {
+    private Strikes strikes(String ip) {
+        if (strikes.size() > 256) strikes.clear();   // bounded; worst case a lock is forgotten
+        Strikes st = strikes.get(ip);
+        if (st == null) strikes.put(ip, st = new Strikes());
+        return st;
+    }
+
+    private synchronized JSONObject startPairing(String ip) throws Exception {
         long now = System.currentTimeMillis();
-        if (now < lockedUntil) return err(lockMessage(now));
+        Strikes st = strikes(ip);
+        if (now < st.lockedUntil) return err(lockMessage(st, now));
         if (pairCode == null || now > pairUntil) {
             pairCode = String.format(Locale.US, "%06d", rnd.nextInt(1_000_000));
             pairUntil = now + 300_000;
+            codeFailures = 0;
         }
         String code = pairCode;
         runOnMain(() -> {
@@ -370,23 +405,23 @@ final class PhoneServer {
         return ok();
     }
 
-    private synchronized JSONObject confirmPairing(String code) throws Exception {
+    private synchronized JSONObject confirmPairing(String code, String ip) throws Exception {
         long now = System.currentTimeMillis();
-        if (now < lockedUntil) return err(lockMessage(now));
+        Strikes st = strikes(ip);
+        if (now < st.lockedUntil) return err(lockMessage(st, now));
         if (pairCode == null || now > pairUntil) return err("code expired, ask for a new one");
         if (!pairCode.equals(code)) {
-            if (++failures >= 5) {
-                failures = 0;
-                pairCode = null;
-                lockedUntil = now + lockMs;
-                lockMs = Math.min(lockMs * 2, 24 * 3_600_000L);
-                return err(lockMessage(now));
+            if (++codeFailures >= 20) pairCode = null;
+            if (++st.failures >= 5) {
+                st.failures = 0;
+                st.lockedUntil = now + st.lockMs;
+                st.lockMs = Math.min(st.lockMs * 2, 24 * 3_600_000L);
+                return err(lockMessage(st, now));
             }
-            return err("wrong code");
+            return err(pairCode == null ? "too many wrong codes: ask for a new one" : "wrong code");
         }
         pairCode = null;
-        failures = 0;
-        lockMs = 10 * 60_000L;
+        strikes.remove(ip);
         byte[] b = new byte[16];
         rnd.nextBytes(b);
         StringBuilder sb = new StringBuilder();
@@ -399,8 +434,8 @@ final class PhoneServer {
         return ok().put("token", token);
     }
 
-    private String lockMessage(long now) {
-        long min = (lockedUntil - now + 59_999) / 60_000;
+    private static String lockMessage(Strikes st, long now) {
+        long min = (st.lockedUntil - now + 59_999) / 60_000;
         return "too many wrong codes: try again in " + min + " min";
     }
 
