@@ -7,7 +7,11 @@
         <item>com.amazon.amazonvideo.livingroom</item>
         <item>in.startv.hotstar</item>
         <item>com.google.android.youtube.tv</item>
+        <item>com.nk.live_tv</item>
     </string-array>
+
+    <!-- Apps per row, in the dock and in the grid (3 to 6). -->
+    <integer name="columns">5</integer>
 
     <!-- Apps never shown in the grid. -->
     <string-array name="hidden_packages">
@@ -20,7 +24,17 @@
     <!-- Name in the greeting ("Good evening, Sam"). Leave empty for no name. -->
     <string name="greeting_name"></string>
 
-    <!-- Wallpaper: put an image at res/drawable-nodpi/wallpaper.jpg (or .png) and set this to true.
-         false = pitch black. -->
-    <bool name="use_wallpaper">false</bool>
+    <!-- Follower counters under the top-right buttons, refreshed every 30 minutes while the home
+         screen is open. Leave any of them empty to hide that counter. -->
+    <!-- YouTube channel handle -->
+    <string name="youtube_channel">@AIWithKulwant</string>
+    <!-- Instagram username (instagram.com/<this>) -->
+    <string name="instagram_user">kulwantnagi</string>
+    <!-- Facebook profile or page name (facebook.com/<this>) -->
+    <string name="facebook_page">kulwant.nagi</string>
+
+    <!-- Wallpapers: 1280x720 images named wallpaper_1.jpg, wallpaper_2.jpg, ... in res/drawable-nodpi/.
+         With more than one they fade from one to the next every wallpaper_seconds. false = pitch black. -->
+    <bool name="use_wallpaper">true</bool>
+    <integer name="wallpaper_seconds">30</integer>
 </resources>

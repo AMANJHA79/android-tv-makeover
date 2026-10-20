@@ -97,8 +97,14 @@ final class InputsMenu {
 
     private void load() {
         items.clear();
+        items.addAll(list(c));
+    }
+
+    /** HDMI ports (sorted), then AV, then Live TV; also used by the phone page. */
+    static List<Item> list(Context c) {
+        List<Item> items = new ArrayList<>();
         TvInputManager tim = (TvInputManager) c.getSystemService(Context.TV_INPUT_SERVICE);
-        if (tim == null) return;
+        if (tim == null) return items;
         List<Item> hdmi = new ArrayList<>(), av = new ArrayList<>();
         TvInputInfo tuner = null;
         for (TvInputInfo info : tim.getTvInputList()) {
@@ -130,5 +136,6 @@ final class InputsMenu {
             it.intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             items.add(it);
         }
+        return items;
     }
 }

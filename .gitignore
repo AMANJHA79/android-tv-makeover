@@ -23,3 +23,6 @@ apps/live-tv/android/build/
 .DS_Store
 .idea/
 *.iml
+
+# Your own wallpapers (personal photos): put them in launcher/app/src/main/res/drawable-nodpi/
+launcher/app/src/main/res/drawable-nodpi/wallpaper*
