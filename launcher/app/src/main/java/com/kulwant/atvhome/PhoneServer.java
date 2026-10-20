@@ -59,12 +59,16 @@ final class PhoneServer {
     private final KeyInjector keys;
     private volatile boolean connecting;
 
-    // pairing: one 6-digit code at a time. Wrong guesses are counted per device (IP): 5 lock that
-    // device out for 10 minutes, doubling each time, so a stranger on the Wi-Fi can't lock you out.
-    // Each code also dies after 20 wrong guesses in total, so many devices can't brute-force it.
+    // pairing: one 6-digit code at a time. Two limits on wrong guesses:
+    //  - per device (IP): 5 lock that device out for 10 minutes, doubling, so one stranger can't
+    //    keep everyone else from pairing;
+    //  - for everyone together: 20 pause all pairing for 1 minute, doubling up to an hour (reset by
+    //    a successful pairing), so even many devices can't guess a code (~20 guesses/hour at most).
     private String pairCode;
     private long pairUntil;
-    private int codeFailures;
+    private int globalFailures;
+    private long globalPauseUntil;
+    private long globalPauseMs = 60_000L;
     private static final class Strikes {
         int failures;
         long lockedUntil;
@@ -380,7 +384,11 @@ final class PhoneServer {
     }
 
     private Strikes strikes(String ip) {
-        if (strikes.size() > 256) strikes.clear();   // bounded; worst case a lock is forgotten
+        if (strikes.size() > 256) {
+            // bounded, but never forget an active lock: drop only devices that aren't locked
+            long now = System.currentTimeMillis();
+            strikes.values().removeIf(x -> x.lockedUntil <= now);
+        }
         Strikes st = strikes.get(ip);
         if (st == null) strikes.put(ip, st = new Strikes());
         return st;
@@ -389,11 +397,11 @@ final class PhoneServer {
     private synchronized JSONObject startPairing(String ip) throws Exception {
         long now = System.currentTimeMillis();
         Strikes st = strikes(ip);
-        if (now < st.lockedUntil) return err(lockMessage(st, now));
+        if (now < st.lockedUntil) return err(lockMessage(st.lockedUntil, now));
+        if (now < globalPauseUntil) return err(lockMessage(globalPauseUntil, now));
         if (pairCode == null || now > pairUntil) {
             pairCode = String.format(Locale.US, "%06d", rnd.nextInt(1_000_000));
             pairUntil = now + 300_000;
-            codeFailures = 0;
         }
         String code = pairCode;
         runOnMain(() -> {
@@ -408,20 +416,29 @@ final class PhoneServer {
     private synchronized JSONObject confirmPairing(String code, String ip) throws Exception {
         long now = System.currentTimeMillis();
         Strikes st = strikes(ip);
-        if (now < st.lockedUntil) return err(lockMessage(st, now));
+        if (now < st.lockedUntil) return err(lockMessage(st.lockedUntil, now));
+        if (now < globalPauseUntil) return err(lockMessage(globalPauseUntil, now));
         if (pairCode == null || now > pairUntil) return err("code expired, ask for a new one");
         if (!pairCode.equals(code)) {
-            if (++codeFailures >= 20) pairCode = null;
+            if (++globalFailures >= 20) {
+                globalFailures = 0;
+                pairCode = null;
+                globalPauseUntil = now + globalPauseMs;
+                globalPauseMs = Math.min(globalPauseMs * 2, 3_600_000L);
+                return err(lockMessage(globalPauseUntil, now));
+            }
             if (++st.failures >= 5) {
                 st.failures = 0;
                 st.lockedUntil = now + st.lockMs;
                 st.lockMs = Math.min(st.lockMs * 2, 24 * 3_600_000L);
-                return err(lockMessage(st, now));
+                return err(lockMessage(st.lockedUntil, now));
             }
-            return err(pairCode == null ? "too many wrong codes: ask for a new one" : "wrong code");
+            return err("wrong code");
         }
         pairCode = null;
         strikes.remove(ip);
+        globalFailures = 0;
+        globalPauseMs = 60_000L;
         byte[] b = new byte[16];
         rnd.nextBytes(b);
         StringBuilder sb = new StringBuilder();
@@ -434,8 +451,8 @@ final class PhoneServer {
         return ok().put("token", token);
     }
 
-    private static String lockMessage(Strikes st, long now) {
-        long min = (st.lockedUntil - now + 59_999) / 60_000;
+    private static String lockMessage(long until, long now) {
+        long min = (until - now + 59_999) / 60_000;
         return "too many wrong codes: try again in " + min + " min";
     }
 
