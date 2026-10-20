@@ -104,7 +104,8 @@ The launcher serves a control page on your home Wi-Fi at `http://<TV IP>:8080` (
 `.tv-ip` after `tools/find-tv.sh`, or in the TV's Wi-Fi settings).
 
 1. Open it in Safari (or any phone browser) on the same Wi-Fi.
-2. Tap **Show code on TV** and type the 6-digit code the TV shows. Each phone pairs once.
+2. Tap **Pair with TV**. The TV asks "Allow this phone to control the TV?" over whatever is on
+   screen: press Right, then OK on the remote. Each phone pairs once.
 3. On iPhone: Share → **Add to Home Screen**, and it opens full-screen like an app.
 
 Four tabs:
@@ -131,9 +132,10 @@ key press is a single shell-builtin write of raw Linux input events to the remot
 remote doesn't have (Enter, and on some TVs a few letters) fall back to `input keyevent` /
 `input text`. See `KeyInjector.java`.
 
-**Security.** Only paired phones can use the page: pairing needs the code shown on the TV, codes are
-6 digits, and 5 wrong codes lock pairing for 10 minutes (doubling after that). Paired phones get a
-random token. The server only answers requests addressed to an IP, which blocks DNS-rebinding attacks
+**Security.** Only paired phones can use the page, and pairing needs someone in the room: it's
+approved with the TV remote, so there is no code to guess from the network ("Don't allow" is
+selected first, one request at a time, a refused phone waits a minute). Paired phones get a random
+token, and "Unpair this phone" revokes it on the TV. Bodies from unpaired callers are capped at 4 KB. The server only answers requests addressed to an IP, which blocks DNS-rebinding attacks
 from websites. It is still plain HTTP on your home network, and the remote has the same power as
 network ADB (which anyone on your Wi-Fi can already reach while it's on), so use it on a network you
 trust.
@@ -176,6 +178,9 @@ All in `launcher/app/src/main/res/values/config.xml`:
 - **The phone page doesn't load:** the phone must be on the same Wi-Fi, and the address must be the
   TV's IP, not a name. If your router gives the TV a new IP now and then, reserve one for it in the
   router's DHCP settings, or the page and Siri links stop working.
+- **Pairing says the TV can't show the prompt:**
+  `tools/tv shell "appops set com.kulwant.atvhome SYSTEM_ALERT_WINDOW allow"` (`build_and_install.sh`
+  does this).
 - **The Remote tab shows a yellow message:** accept "Allow USB debugging?" on the TV (tick Always
   allow). If network debugging was switched off, turn it back on in Developer options.
 - **Gradle says everything is up to date but the APK didn't change:** build with

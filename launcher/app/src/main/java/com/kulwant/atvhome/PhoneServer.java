@@ -41,9 +41,10 @@ import java.util.concurrent.Executors;
 /**
  * The phone control page: a tiny HTTP server on the home network (port 8080).
  *
- * A phone pairs once: it asks for a code, the TV shows a 6-digit code on screen, the phone sends it
- * back and gets a token it keeps. Every other call needs that token (header X-Token or ?t=), so
- * guests on the Wi-Fi can't use it. GET works for every action so Siri Shortcuts can use plain URLs.
+ * A phone pairs once: it asks, the TV shows "Allow this phone to control the TV?" and someone
+ * answers with the remote; the phone then gets a token it keeps. Every other call needs that token
+ * (header X-Token or ?t=), so guests on the Wi-Fi can't use it. GET works for every action so Siri
+ * Shortcuts can use plain URLs.
  */
 final class PhoneServer {
 
@@ -59,22 +60,19 @@ final class PhoneServer {
     private final KeyInjector keys;
     private volatile boolean connecting;
 
-    // pairing: one 6-digit code at a time. Two limits on wrong guesses:
-    //  - per device (IP): 5 lock that device out for 10 minutes, doubling, so one stranger can't
-    //    keep everyone else from pairing;
-    //  - for everyone together: 20 pause all pairing for 1 minute, doubling up to an hour (reset by
-    //    a successful pairing), so even many devices can't guess a code (~20 guesses/hour at most).
-    private String pairCode;
-    private long pairUntil;
-    private int globalFailures;
-    private long globalPauseUntil;
-    private long globalPauseMs = 60_000L;
-    private static final class Strikes {
-        int failures;
-        long lockedUntil;
-        long lockMs = 10 * 60_000L;
+    // pairing: a phone asks, the TV shows "Allow this phone…?" over whatever is on screen, and
+    // someone in the room answers with the remote. Nothing to guess from the network. One request
+    // at a time, at most one prompt every 10 s, and a phone that was refused waits a minute.
+    private static final class Request {
+        String id, ip;
+        long until;
+        int state;   // 0 waiting, 1 allowed, 2 refused
+        String token;
     }
-    private final Map<String, Strikes> strikes = new HashMap<>();
+    private Request request;
+    private long lastPromptAt;
+    private final Map<String, Long> refusedUntil = new HashMap<>();
+    private PairingPrompt prompt;
 
     // apps (with banners) are cached briefly: rendering them is the slow part
     private AppRepo.Result apps;
@@ -135,7 +133,7 @@ final class PhoneServer {
 
     /** Routes anyone on the network may call (pairing, the page itself); their bodies are tiny. */
     private static final Set<String> OPEN = new HashSet<>(java.util.Arrays.asList(
-            "/", "/index.html", "/icon.png", "/favicon.ico", "/api/pair", "/api/pair/confirm"));
+            "/", "/index.html", "/icon.png", "/favicon.ico", "/api/pair", "/api/pair/status"));
     private static final int MAX_OPEN_BODY = 4096;
 
     private void handle(Socket s) {
@@ -265,10 +263,10 @@ final class PhoneServer {
                 send(out, 200, "image/png", icon(), "max-age=86400");
                 return;
             case "/api/pair":
-                json(out, 200, startPairing(r.ip));
+                json(out, 200, startPairing(r));
                 return;
-            case "/api/pair/confirm":
-                json(out, 200, confirmPairing(param(r, "code"), r.ip));
+            case "/api/pair/status":
+                json(out, 200, pairStatus(param(r, "id"), r.ip));
                 return;
         }
         if (!authorised(r)) {
@@ -383,77 +381,80 @@ final class PhoneServer {
         if (tokens.remove(t)) prefs.edit().putStringSet("tokens", tokens).apply();
     }
 
-    private Strikes strikes(String ip) {
-        if (strikes.size() > 256) {
-            // bounded, but never forget an active lock: drop only devices that aren't locked
-            long now = System.currentTimeMillis();
-            strikes.values().removeIf(x -> x.lockedUntil <= now);
-        }
-        Strikes st = strikes.get(ip);
-        if (st == null) strikes.put(ip, st = new Strikes());
-        return st;
-    }
-
-    private synchronized JSONObject startPairing(String ip) throws Exception {
+    private synchronized JSONObject startPairing(Req r) throws Exception {
         long now = System.currentTimeMillis();
-        Strikes st = strikes(ip);
-        if (now < st.lockedUntil) return err(lockMessage(st.lockedUntil, now));
-        if (now < globalPauseUntil) return err(lockMessage(globalPauseUntil, now));
-        if (pairCode == null || now > pairUntil) {
-            pairCode = String.format(Locale.US, "%06d", rnd.nextInt(1_000_000));
-            pairUntil = now + 300_000;
+        Long refused = refusedUntil.get(r.ip);
+        if (refused != null && now < refused) return err("Refused on the TV. Try again in a minute.");
+        if (request != null && request.state == 0 && now < request.until) {
+            if (request.ip.equals(r.ip)) return ok().put("id", request.id);   // same phone, same prompt
+            return err("Another phone is asking right now. Try again in a minute.");
         }
-        String code = pairCode;
+        if (now - lastPromptAt < 10_000) return err("Wait a few seconds and try again.");
+        if (!PairingPrompt.canShow(c)) {
+            return err("The TV can't show the pairing prompt yet: allow \"Display over other apps\" for the launcher (see the README).");
+        }
+        Request q = new Request();
+        q.id = randomHex(16);
+        q.ip = r.ip;
+        q.until = now + 60_000;
+        request = q;
+        lastPromptAt = now;
+        String device = deviceName(r.headers.getOrDefault("user-agent", "")) + "  ·  " + r.ip;
         runOnMain(() -> {
-            // a toast shows over whatever app is open; repeat it so it stays up ~10 s
-            for (int i = 0; i < 3; i++) {
-                main.postDelayed(() -> Toast.makeText(c, "Phone pairing code:  " + code, Toast.LENGTH_LONG).show(), i * 3600L);
-            }
+            if (prompt == null) prompt = new PairingPrompt(c);
+            prompt.show(device, allowed -> answer(q, allowed));
+            // nobody answered in time: same as "Don't allow"
+            main.postDelayed(() -> {
+                if (q.state == 0 && prompt.isShowing()) prompt.dismiss(false);
+            }, 60_000);
         });
-        return ok();
+        return ok().put("id", q.id);
     }
 
-    private synchronized JSONObject confirmPairing(String code, String ip) throws Exception {
-        long now = System.currentTimeMillis();
-        Strikes st = strikes(ip);
-        if (now < st.lockedUntil) return err(lockMessage(st.lockedUntil, now));
-        if (now < globalPauseUntil) return err(lockMessage(globalPauseUntil, now));
-        if (pairCode == null || now > pairUntil) return err("code expired, ask for a new one");
-        if (!pairCode.equals(code)) {
-            if (++globalFailures >= 20) {
-                globalFailures = 0;
-                pairCode = null;
-                globalPauseUntil = now + globalPauseMs;
-                globalPauseMs = Math.min(globalPauseMs * 2, 3_600_000L);
-                return err(lockMessage(globalPauseUntil, now));
-            }
-            if (++st.failures >= 5) {
-                st.failures = 0;
-                st.lockedUntil = now + st.lockMs;
-                st.lockMs = Math.min(st.lockMs * 2, 24 * 3_600_000L);
-                return err(lockMessage(st.lockedUntil, now));
-            }
-            return err("wrong code");
+    private synchronized void answer(Request q, boolean allowed) {
+        if (q.state != 0) return;
+        if (!allowed) {
+            q.state = 2;
+            if (refusedUntil.size() > 256) refusedUntil.values().removeIf(t -> t < System.currentTimeMillis());
+            refusedUntil.put(q.ip, System.currentTimeMillis() + 60_000);
+            return;
         }
-        pairCode = null;
-        strikes.remove(ip);
-        globalFailures = 0;
-        globalPauseMs = 60_000L;
-        byte[] b = new byte[16];
+        q.token = randomHex(16);
+        Set<String> tokens = new HashSet<>(prefs.getStringSet("tokens", new HashSet<>()));
+        tokens.add(q.token);
+        prefs.edit().putStringSet("tokens", tokens).apply();
+        q.state = 1;
+        Toast.makeText(c, "Phone paired", Toast.LENGTH_SHORT).show();
+    }
+
+    /** The phone polls this with the id it got; only that phone (same IP) can collect the token. */
+    private synchronized JSONObject pairStatus(String id, String ip) throws Exception {
+        Request q = request;
+        if (q == null || !q.id.equals(id) || !q.ip.equals(ip)) return err("No pairing request. Start again.");
+        if (q.state == 1) {
+            request = null;   // the token is handed out once
+            return ok().put("token", q.token);
+        }
+        if (q.state == 2) return err("Refused on the TV.");
+        if (System.currentTimeMillis() > q.until + 5_000) return err("Nobody answered on the TV. Start again.");
+        return ok().put("waiting", true);
+    }
+
+    private static String deviceName(String ua) {
+        if (ua.contains("iPhone")) return "iPhone";
+        if (ua.contains("iPad")) return "iPad";
+        if (ua.contains("Android")) return "Android phone";
+        if (ua.contains("Macintosh")) return "Mac";
+        if (ua.contains("Windows")) return "Windows PC";
+        return "A device";
+    }
+
+    private String randomHex(int bytes) {
+        byte[] b = new byte[bytes];
         rnd.nextBytes(b);
         StringBuilder sb = new StringBuilder();
         for (byte x : b) sb.append(String.format(Locale.US, "%02x", x));
-        String token = sb.toString();
-        Set<String> tokens = new HashSet<>(prefs.getStringSet("tokens", new HashSet<>()));
-        tokens.add(token);
-        prefs.edit().putStringSet("tokens", tokens).apply();
-        runOnMain(() -> Toast.makeText(c, "Phone paired", Toast.LENGTH_SHORT).show());
-        return ok().put("token", token);
-    }
-
-    private static String lockMessage(long until, long now) {
-        long min = (until - now + 59_999) / 60_000;
-        return "too many wrong codes: try again in " + min + " min";
+        return sb.toString();
     }
 
     // ---------------------------------------------------------------- remote (trackpad, keyboard)
