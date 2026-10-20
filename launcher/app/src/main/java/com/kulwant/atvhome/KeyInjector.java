@@ -116,10 +116,12 @@ final class KeyInjector {
 
     /**
      * Types text as if on a keyboard (US layout). Characters the remote has no key for (here q and
-     * `, and anything non-ASCII) go through `input text` instead, in order.
+     * `) go through `input text` instead, in order. Only printable ASCII is typed: the text ends up
+     * in a shell, where control characters (Ctrl-C, newlines) could end the command and start another.
      */
     synchronized void type(String text) throws Exception {
         if (!isConnected()) throw new IllegalStateException("remote not connected");
+        text = text.replaceAll("[^\\x20-\\x7e]", "");
         Integer shiftCode = codes.get("SHIFT_LEFT");
         StringBuilder ev = new StringBuilder(), slow = new StringBuilder();
         int chars = 0;
@@ -165,7 +167,8 @@ final class KeyInjector {
 
     /** `input text` runs in order after the key writes because the shell is sequential. */
     private void inputText(CharSequence s) throws Exception {
-        String t = s.toString().replace(" ", "%s").replace("'", "'\\''");
+        // printable ASCII only (type() already filters; kept here so this can never take anything else)
+        String t = s.toString().replaceAll("[^\\x20-\\x7e]", "").replace(" ", "%s").replace("'", "'\\''");
         run("input text '" + t + "'");
     }
 
